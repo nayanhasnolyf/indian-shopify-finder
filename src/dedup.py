@@ -22,7 +22,11 @@ def is_similar(str1: str, str2: str, threshold: float = 0.85) -> bool:
     """Returns True if the similarity ratio between two strings is above the threshold."""
     if not str1 or not str2:
         return False
-    return difflib.SequenceMatcher(None, str1.lower().strip(), str2.lower().strip()).ratio() >= threshold
+    sm = difflib.SequenceMatcher(None, str1.lower().strip(), str2.lower().strip())
+    # Cheap upper bounds first: keeps O(n^2) pairwise dedup fast at 1,000+ records
+    if sm.real_quick_ratio() < threshold or sm.quick_ratio() < threshold:
+        return False
+    return sm.ratio() >= threshold
 
 def deduplicate_data(data_records: list) -> list:
     """

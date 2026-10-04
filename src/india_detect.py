@@ -21,16 +21,49 @@ PRIVACY_SHIELDS = [
 ]
 
 INDIAN_STATES = [
-    'maharashtra', 'karnataka', 'tamil nadu', 'delhi', 'gujarat', 
-    'uttar pradesh', 'kerala', 'telangana', 'west bengal', 'haryana', 'punjab'
+    'andhra pradesh', 'arunachal pradesh', 'assam', 'bihar', 'chhattisgarh', 'goa',
+    'gujarat', 'haryana', 'himachal pradesh', 'jharkhand', 'karnataka', 'kerala',
+    'madhya pradesh', 'maharashtra', 'manipur', 'meghalaya', 'mizoram', 'nagaland',
+    'odisha', 'punjab', 'rajasthan', 'sikkim', 'tamil nadu', 'telangana', 'tripura',
+    'uttar pradesh', 'uttarakhand', 'west bengal', 'delhi', 'jammu', 'kashmir',
+    'chandigarh', 'puducherry', 'ladakh'
 ]
 INDIAN_CITIES = [
-    'mumbai', 'bengaluru', 'bangalore', 'new delhi', 'chennai', 'hyderabad', 'kolkata', 'pune', 'ahmedabad', 'jaipur'
+    'mumbai', 'bengaluru', 'bangalore', 'new delhi', 'chennai', 'hyderabad', 'kolkata',
+    'pune', 'ahmedabad', 'jaipur', 'gurugram', 'gurgaon', 'noida', 'surat', 'lucknow',
+    'kochi', 'indore', 'coimbatore', 'vadodara', 'nagpur', 'thane', 'navi mumbai',
+    'ghaziabad', 'faridabad', 'ludhiana', 'bhopal', 'mysuru', 'mysore', 'visakhapatnam'
 ]
+INDIA_LOCATIONS = INDIAN_STATES + INDIAN_CITIES
 
-def smart_fetch(url: str) -> str:
-    """Tries to fetch from CC archive first, then live fetch as fallback."""
-    # 1. Try Common Crawl Archive
+# Strict currency patterns. The old substring checks ('rs ', 'inr') matched ordinary
+# words like "yours " / "colours " and caused hundreds of false borderline hits.
+CURRENCY_RE = re.compile(r'₹|\bINR\b|\bRs\.?\s?\d', re.IGNORECASE)
+# Shopify exposes the active currency + conversion rate; rate 1.0 means INR is the
+# shop's *base* currency rather than a converted display currency.
+SHOPIFY_BASE_INR_RE = re.compile(r'Shopify\.currency\s*=\s*\{\s*"active"\s*:\s*"INR"\s*,\s*"rate"\s*:\s*"1(?:\.0+)?"')
+PIN_RE = re.compile(r'\b[1-8]\d{2}\s?\d{3}\b')
+
+def smart_fetch(url: str, use_archive: bool = False) -> str:
+    """Live fetch first; optionally fall back to the Common Crawl archive.
+
+    Querying the CC index for every subpage was the slowest step of the pipeline and
+    frequently rate-limited, so the archive is now opt-in.
+    """
+    # 1. Live Fetch
+    try:
+        resp = default_client.get(url)
+        if resp and resp.status_code == 200:
+            return resp.text
+    except RobotsBlockedError:
+        pass
+    except Exception:
+        pass
+
+    if not use_archive:
+        return ""
+
+    # 2. Common Crawl Archive fallback
     try:
         cc_api_url = "https://index.commoncrawl.org/CC-MAIN-2024-10-index"
         resp = default_client.get(f"{cc_api_url}?url={url}&output=json&limit=1", ignore_robots=True)
@@ -46,16 +79,6 @@ def smart_fetch(url: str) -> str:
                 html = fetch_archived_html(warc)
                 if html: 
                     return html
-    except Exception:
-        pass
-    
-    # 2. Live Fetch Fallback
-    try:
-        resp = default_client.get(url)
-        if resp and resp.status_code == 200:
-            return resp.text
-    except RobotsBlockedError:
-        pass
     except Exception:
         pass
         
@@ -74,24 +97,33 @@ def score_html_content(page_html: str, source_name: str, current_evidence: list)
             confidence_added += 40
             current_evidence.append(f"Phone number prefix +91 found (Source: {source_name})")
             
-    # Address patterns
+    # Address patterns (word-boundary match so 'goa' doesn't hit 'goal', etc.)
     if not any("Indian location(s) found" in e for e in current_evidence):
-        found_locations = [loc for loc in INDIAN_STATES + INDIAN_CITIES if loc in text_lower]
+        found_locations = [loc for loc in INDIA_LOCATIONS if re.search(rf'\b{re.escape(loc)}\b', text_lower)]
         if found_locations:
             confidence_added += 30
-            current_evidence.append(f"Indian location(s) found: {', '.join(found_locations)} (Source: {source_name})")
+            current_evidence.append(f"Indian location(s) found: {', '.join(found_locations[:5])} (Source: {source_name})")
             
-    # PIN code
+    # PIN code - only counted when it appears near an Indian location / 'india'
     if not any("6-digit PIN" in e for e in current_evidence):
-        if re.search(r'\b[1-8][0-9]{5}\b', text_content):
-            confidence_added += 15
-            current_evidence.append(f"Possible Indian 6-digit PIN code found (Source: {source_name})")
+        for m in PIN_RE.finditer(text_lower):
+            window = text_lower[max(0, m.start() - 100): m.end() + 30]
+            if 'india' in window or any(loc in window for loc in INDIA_LOCATIONS):
+                confidence_added += 15
+                current_evidence.append(f"Indian 6-digit PIN code near address found (Source: {source_name})")
+                break
             
     # Currency
     if not any("currency symbol" in e for e in current_evidence):
-        if '₹' in text_content or 'inr' in text_lower or 'rs.' in text_lower or 'rs ' in text_lower:
-            confidence_added += 30
+        if CURRENCY_RE.search(text_content):
+            confidence_added += 20
             current_evidence.append(f"Indian currency symbol/acronym (₹, INR, Rs) found (Source: {source_name})")
+
+    # Shopify base currency is INR (raw HTML, not visible text)
+    if not any("base currency INR" in e for e in current_evidence):
+        if SHOPIFY_BASE_INR_RE.search(page_html):
+            confidence_added += 40
+            current_evidence.append(f"Shopify base currency INR (Source: {source_name})")
             
     # HTML Lang tags
     if not any("HTML lang attribute" in e for e in current_evidence):

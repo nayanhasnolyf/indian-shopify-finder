@@ -6,6 +6,7 @@ import json
 import argparse
 import pandas as pd
 import logging
+from collections import Counter
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,8 +17,9 @@ from .india_detect import is_india_based
 from .extract import extract_store_data
 from .dedup import deduplicate_data
 from .http_utils import default_client, RobotsBlockedError
+from .shopify_meta import fetch_shopify_meta, meta_is_india, resolves
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 def save_checkpoint(data, filepath):
@@ -34,7 +36,90 @@ def calculate_miss_rates(data_records):
         rates[f.replace('_found', '')] = ((total - found_count) / total) * 100
     return rates
 
-def run_pipeline(limit=None):
+
+def process_candidate(item):
+    """Returns (status, payload). Status is one of:
+    dead, blocked, failed_html, not_shopify, not_india, borderline, success
+    """
+    domain = item['domain']
+    source = item['source']
+    url = f"https://{domain}"
+    warc_metadata = item.get('warc_metadata')
+
+    # 0. Cheap DNS pre-filter: skip unresolvable hosts before any HTTP work
+    if not resolves(domain):
+        return ('dead', None)
+
+    # 1. Authoritative path: Shopify /meta.json gives the store's configured country
+    try:
+        meta = fetch_shopify_meta(domain)
+    except RobotsBlockedError as e:
+        return ('blocked', {'domain': domain, 'reason': str(e)})
+
+    if meta:
+        india = meta_is_india(meta)
+        if india is False:
+            return ('not_india', None)
+        if india is True:
+            page_html = ""
+            try:
+                resp = default_client.get(url)
+                if resp is not None and resp.status_code == 200:
+                    page_html = resp.text
+            except RobotsBlockedError as e:
+                return ('blocked', {'domain': domain, 'reason': str(e)})
+            except Exception:
+                pass
+            data = extract_store_data(domain, page_html or None, meta=meta)
+            data.update({
+                'source': source,
+                'india_signal': f"meta.json country=IN ({meta.get('province') or 'n/a'})",
+                'india_confidence': 100,
+                'whois_shielded': None,
+            })
+            return ('success', data)
+        # india is None -> fall through to heuristic scoring
+
+    # 2. Legacy heuristic path (meta.json unavailable)
+    page_html = ""
+    if warc_metadata:
+        page_html = fetch_archived_html(warc_metadata)
+    if not page_html:
+        try:
+            resp = default_client.get(url)
+            if resp is not None and resp.status_code == 200:
+                page_html = resp.text
+        except RobotsBlockedError as e:
+            return ('blocked', {'domain': domain, 'reason': str(e)})
+        except Exception:
+            pass
+
+    if not page_html:
+        return ('failed_html', None)
+
+    shopify_result = is_shopify_store(domain, page_html)
+    if shopify_result['confidence'] < 40 and not meta:
+        return ('not_shopify', None)
+
+    india_result = is_india_based(domain, page_html)
+    conf = india_result['confidence']
+
+    if india_result['conflict_flag'] or (20 <= conf <= 60):
+        return ('borderline', {'url': url, 'confidence': conf, 'evidence': "; ".join(india_result['evidence'])})
+    if conf < 20:
+        return ('not_india', None)
+
+    data = extract_store_data(domain, page_html, meta=meta)
+    data.update({
+        'source': source,
+        'india_signal': "; ".join(india_result['evidence'])[:300],
+        'india_confidence': conf,
+        'whois_shielded': india_result.get('whois_shielded', False),
+    })
+    return ('success', data)
+
+
+def run_pipeline(limit=None, use_serper=True, use_tranco=True, use_static=True, workers=40):
     print("Starting pipeline...\n")
     output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data')
     os.makedirs(output_dir, exist_ok=True)
@@ -46,7 +131,10 @@ def run_pipeline(limit=None):
     results_json = os.path.join(output_dir, 'results.json')
     
     print("Sourcing candidates...")
-    candidates_data = find_candidate_domains(csv_filepath="data/seed_list.csv")
+    candidates_data = find_candidate_domains(
+        csv_filepath=os.path.join(output_dir, 'seed_list.csv'),
+        use_serper=use_serper, use_tranco=use_tranco, use_static=use_static,
+    )
     if limit and limit > 0:
         candidates_data = candidates_data[:limit]
         
@@ -54,94 +142,40 @@ def run_pipeline(limit=None):
         return
 
     import concurrent.futures
-    import threading
+    import time
     
     total_candidates = len(candidates_data)
-    shopify_confirmed, india_confirmed = 0, 0
+    print(f"Processing {total_candidates} candidates with {workers} workers...")
+    counts = Counter()
     raw_data, borderline_cases, blocked_cases = [], [], []
-    
-    lock = threading.Lock()
-    processed_count = 0
-    
-    def process_candidate(item):
-        domain = item['domain']
-        source = item['source']
-        url = f"https://{domain}"
-        warc_metadata = item.get('warc_metadata')
-        
-        page_html = ""
-        is_live_fetch = False
-        
-        # 1. Fetch HTML (Prefer Archive)
-        if warc_metadata:
-             page_html = fetch_archived_html(warc_metadata)
-             
-        # Fallback to Live Fetch
-        if not page_html:
-             is_live_fetch = True
-             try:
-                 resp = default_client.get(url)
-                 if resp and resp.status_code == 200:
-                     page_html = resp.text
-             except RobotsBlockedError as e:
-                 return ('blocked', {'domain': domain, 'reason': str(e)})
-                 
-        if not page_html:
-             return ('failed_html', None)
-             
-        # 2. Check Shopify
-        shopify_result = is_shopify_store(domain, page_html)
-        if shopify_result['confidence'] < 40:
-            return ('not_shopify', None)
-            
-        # 3. Check India
-        india_result = is_india_based(domain, page_html)
-        conf = india_result['confidence']
-        
-        if india_result['conflict_flag'] or (20 <= conf <= 60):
-            return ('borderline', {'url': url, 'confidence': conf, 'evidence': "; ".join(india_result['evidence'])})
-            
-        if conf < 20:
-            return ('not_india', None)
-            
-        # 4. Extract
-        data = extract_store_data(domain, page_html)
-        data['whois_shielded'] = india_result.get('whois_shielded', False)
-        return ('success', data)
+    start = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_item = {executor.submit(process_candidate, item): item for item in candidates_data}
         
-        for future in concurrent.futures.as_completed(future_to_item):
-            with lock:
-                processed_count += 1
-                if processed_count % 50 == 0:
-                    print(f"Processed {processed_count}/{total_candidates}...")
-                    
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_item), 1):
             try:
                 status, result = future.result()
-                with lock:
-                    if status == 'blocked':
-                        blocked_cases.append(result)
-                    elif status == 'not_shopify':
-                        pass
-                    elif status == 'borderline':
-                        shopify_confirmed += 1
-                        borderline_cases.append(result)
-                    elif status == 'not_india':
-                        shopify_confirmed += 1
-                    elif status == 'success':
-                        shopify_confirmed += 1
-                        india_confirmed += 1
-                        raw_data.append(result)
-                        
-                        if len(raw_data) % 10 == 0:
-                            save_checkpoint(raw_data, checkpoint_file)
             except Exception as e:
-                pass
+                status, result = 'error', None
+                logger.debug(f"{future_to_item[future]['domain']}: {e}")
+            counts[status] += 1
+
+            if status == 'blocked':
+                blocked_cases.append(result)
+            elif status == 'borderline':
+                borderline_cases.append(result)
+            elif status == 'success':
+                raw_data.append(result)
+                if len(raw_data) % 25 == 0:
+                    save_checkpoint(raw_data, checkpoint_file)
+
+            if i % 100 == 0:
+                print(f"Processed {i}/{total_candidates} | confirmed {counts['success']} | "
+                      f"{time.time() - start:.0f}s elapsed")
             
-    if borderline_cases: pd.DataFrame(borderline_cases).to_csv(borderline_file, index=False)
-    if blocked_cases: pd.DataFrame(blocked_cases).to_csv(blocked_file, index=False)
+    pd.DataFrame(borderline_cases, columns=['url', 'confidence', 'evidence']).to_csv(borderline_file, index=False)
+    pd.DataFrame(blocked_cases, columns=['domain', 'reason']).to_csv(blocked_file, index=False)
         
     print("\nDeduplicating extracted data...")
     final_data = deduplicate_data(raw_data)
@@ -151,14 +185,19 @@ def run_pipeline(limit=None):
         df = pd.DataFrame(final_data)
         df.to_csv(results_csv, index=False)
         with open(results_json, 'w', encoding='utf-8') as f:
-            json.dump(final_data, f, indent=4)
-    
+            json.dump(final_data, f, indent=4, default=str)
+
+    shopify_confirmed = counts['success'] + counts['borderline'] + counts['not_india']
     print("\n" + "="*45)
     print("           PIPELINE SUMMARY")
     print("="*45)
     print(f"Total candidates checked: {total_candidates}")
-    print(f"Shopify confirm rate:     {(shopify_confirmed / total_candidates * 100) if total_candidates else 0:.1f}% ({shopify_confirmed})")
-    print(f"India confirm rate:       {(india_confirmed / shopify_confirmed * 100) if shopify_confirmed else 0:.1f}% ({india_confirmed})")
+    print(f"Runtime:                  {(time.time() - start) / 60:.1f} min")
+    print(f"Dead (no DNS):            {counts['dead']}")
+    print(f"Fetch failed:             {counts['failed_html'] + counts['error']}")
+    print(f"Not Shopify:              {counts['not_shopify']}")
+    print(f"Shopify confirmed:        {shopify_confirmed}")
+    print(f"India confirm rate:       {(counts['success'] / shopify_confirmed * 100) if shopify_confirmed else 0:.1f}% ({counts['success']})")
     print(f"Final Count (post-dedup): {final_count}")
     print(f"Borderline / Review:      {len(borderline_cases)}")
     print(f"Blocked by robots.txt:    {len(blocked_cases)}")
@@ -172,5 +211,10 @@ def run_pipeline(limit=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--workers", type=int, default=40)
+    parser.add_argument("--no-serper", action="store_true", help="Skip Serper API sourcing")
+    parser.add_argument("--no-tranco", action="store_true", help="Skip Tranco + DNS sourcing")
+    parser.add_argument("--no-static", action="store_true", help="Skip live listicle scraping")
     args = parser.parse_args()
-    run_pipeline(limit=args.limit)
+    run_pipeline(limit=args.limit, use_serper=not args.no_serper, use_tranco=not args.no_tranco,
+                 use_static=not args.no_static, workers=args.workers)

@@ -6,29 +6,31 @@ import logging
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 from .http_utils import default_client, RobotsBlockedError
-from .india_detect import smart_fetch
+from .india_detect import smart_fetch, INDIAN_STATES
 
 logger = logging.getLogger(__name__)
 
-INDIAN_STATES = [
-    'maharashtra', 'karnataka', 'tamil nadu', 'delhi', 'gujarat', 
-    'uttar pradesh', 'kerala', 'telangana', 'west bengal', 'haryana', 'punjab'
-]
-
-def extract_store_data(domain: str, page_html: str = None) -> dict:
+def extract_store_data(domain: str, page_html: str = None, meta: dict = None) -> dict:
     if not domain.startswith(('http://', 'https://')):
         base_url = f'https://{domain}'
     else:
         base_url = domain
+    meta = meta or {}
         
     data = {
         'domain_url': base_url,
+        'store_name': meta.get('name'),
         'emails': None, 'phones': None, 'socials': None, 'category': None,
-        'tagline': None, 'logo_url': None, 'state': None,
+        'tagline': None, 'logo_url': None, 'state': None, 'city': meta.get('city'),
         'emails_found': False, 'phones_found': False, 'socials_found': False,
         'category_found': False, 'tagline_found': False, 'logo_url_found': False,
         'state_found': False
     }
+
+    # Authoritative state from Shopify store settings
+    if meta.get('province'):
+        data['state'] = str(meta['province']).strip().lower()
+        data['state_found'] = True
 
     if not page_html:
         page_html = smart_fetch(base_url)
@@ -172,9 +174,10 @@ def extract_store_data(domain: str, page_html: str = None) -> dict:
     if logo_url:
         data['logo_url'] = logo_url; data['logo_url_found'] = True
 
-    # 7. State
-    found_states = [st for st in INDIAN_STATES if st in text_lower]
-    if found_states:
-        data['state'] = found_states[0]; data['state_found'] = True
+    # 7. State (fallback to page text if meta.json didn't provide one)
+    if not data['state_found']:
+        found_states = [st for st in INDIAN_STATES if re.search(rf'\b{re.escape(st)}\b', text_lower)]
+        if found_states:
+            data['state'] = found_states[0]; data['state_found'] = True
 
     return data

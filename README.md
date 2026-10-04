@@ -72,9 +72,9 @@ A pipeline that discovers Indian Shopify stores, verifies them, and pulls contac
 | Field | Found | Missing |
 |---|---|---|
 | state | 99.5% | 0.5% |
-| tagline | 94.6% | 5.4% |
-| category | 92.7% | 7.3% |
-| socials | 90.4% | 9.6% |
+| tagline | 94.1% | 5.9% |
+| category | 75.2% | 24.8% |
+| socials | 89.7% | 10.3% |
 | emails | 86.8% | 13.2% |
 | logo_url | 87.7% | 12.3% |
 | phones | 72.4% | 27.6% |
@@ -264,6 +264,7 @@ Records are treated as duplicates when they share a normalised domain or an iden
 | `india_signal` | Why the store was accepted, e.g. `meta.json country=IN (Haryana)` |
 | `india_confidence` | 100 for meta.json, otherwise the heuristic score |
 | `whois_shielded` | WHOIS privacy flag (heuristic path only) |
+| `foreign_brand_india_storefront` | True for stores on `in.brand.com` (e.g., `in.loccitane.com`). Included but flagged as deciding if they count as "Indian" is an edge-case judgment call. |
 
 ---
 

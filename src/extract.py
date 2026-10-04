@@ -73,9 +73,9 @@ def extract_store_data(domain: str, page_html: str = None, meta: dict = None) ->
 
     # 1. Emails
     emails = list(set(re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', combined_text)))
-    emails = [e for e in emails if not e.endswith(('sentry.io', 'shopify.com', 'example.com', 'w3.org'))]
+    emails = [e.rstrip('.') for e in emails if not e.endswith(('sentry.io', 'shopify.com', 'example.com', 'w3.org'))]
     if emails:
-        data['emails'] = emails; data['emails_found'] = True
+        data['emails'] = list(set(emails)); data['emails_found'] = True
 
     # 2. Phones
     phone_pattern = r'(?:(?:\+|00)?91)[-\s\.\(\)\[\]]*[6-9](?:[-\s\.\(\)\[\]]*\d){9}'
@@ -114,15 +114,22 @@ def extract_store_data(domain: str, page_html: str = None, meta: dict = None) ->
         for a in s.find_all('a', href=True):
             href = a['href'].lower()
             for p, domain_str in {'instagram': 'instagram.com', 'facebook': 'facebook.com', 'twitter': 'twitter.com', 'x': 'x.com', 'linkedin': 'linkedin.com', 'youtube': 'youtube.com'}.items():
-                if domain_str in href and p not in socials: socials[p] = a['href']
+                if domain_str in href:
+                    parsed = urlparse(href)
+                    path = parsed.path.lower()
+                    if path in ['', '/'] or 'share' in path or 'intent' in path or 'sharer' in path:
+                        continue
+                    if p not in socials: socials[p] = a['href']
     if socials:
         data['socials'] = socials; data['socials_found'] = True
 
     # 4. Category
     categories_to_check = [
         'clothing', 'apparel', 'jewelry', 'electronics', 'beauty', 
-        'health', 'home', 'decor', 'furniture', 'skincare', 'cosmetics', 'wellness'
+        'health', 'home', 'decor', 'furniture', 'skincare', 'cosmetics', 
+        'wellness', 'snacks', 'coffee', 'footwear', 'bags', 'fashion', 'accessories'
     ]
+    invalid_categories = ['product', 'index', 'company']
     category = None
     for s in all_soups:
         if category: break
@@ -132,16 +139,20 @@ def extract_store_data(domain: str, page_html: str = None, meta: dict = None) ->
         if meta_desc and meta_desc.get('content'):
             desc = meta_desc.get('content').lower()
             for cat in categories_to_check:
-                if cat in desc:
+                if re.search(rf'\b{cat}\b', desc):
                     category = cat; break
                     
-        if not category and og_type and og_type.get('content') not in ['website', 'article']:
-            category = og_type.get('content')
+        if not category and og_type and og_type.get('content') and og_type.get('content').lower() not in ['website', 'article']:
+            og_val = og_type.get('content').lower()
+            if og_val not in invalid_categories:
+                category = og_val
             
     if not category:
         # Deep body scan as fallback
         for cat in categories_to_check:
-            if cat in text_lower:
+            if re.search(rf'\b{cat}\b', text_lower):
+                if cat == 'home': # skip 'home' for body text to avoid menu links
+                    continue
                 category = cat; break
 
     if category:
@@ -150,11 +161,23 @@ def extract_store_data(domain: str, page_html: str = None, meta: dict = None) ->
     # 5. Tagline (Homepage only for clarity)
     tagline = None
     meta_desc = soup.find('meta', attrs={'name': 'description'})
+    import html
     if meta_desc and meta_desc.get('content'):
-        tagline = meta_desc.get('content').strip()
+        tagline = html.unescape(meta_desc.get('content').strip())
     else:
         hero = soup.find(['h1', 'h2'])
-        if hero: tagline = hero.get_text(strip=True)
+        if hero: tagline = html.unescape(hero.get_text(strip=True))
+        
+    if tagline:
+        t_lower = tagline.lower()
+        boilerplate = [
+            'country/region', 'main cart', 'menu', 'search', 'home', 
+            'products', 'collections', 'about', 'contact', 'cart', 
+            'checkout', 'catalog', 'my store', 'skip to content', 'home page'
+        ]
+        if any(t_lower == b for b in boilerplate) or len(tagline) < 5:
+            tagline = None
+            
     if tagline:
         data['tagline'] = tagline; data['tagline_found'] = True
 

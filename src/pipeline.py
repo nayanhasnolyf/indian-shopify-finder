@@ -182,10 +182,39 @@ def run_pipeline(limit=None, use_serper=True, use_tranco=True, use_static=True, 
     final_count = len(final_data)
     
     if final_data:
-        df = pd.DataFrame(final_data)
-        df.to_csv(results_csv, index=False)
+        filtered_data = []
+        for d in final_data:
+            filtered_data.append({
+                'domain_url': d.get('domain_url'),
+                'emails': d.get('emails'),
+                'phones': d.get('phones'),
+                'socials': d.get('socials'),
+                'category': d.get('category'),
+                'tagline': d.get('tagline'),
+                'logo_url': d.get('logo_url'),
+                'state': d.get('state'),
+                'foreign_brand_india_storefront': d.get('foreign_brand_india_storefront', False)
+            })
+            
+        df = pd.DataFrame(filtered_data)
+        df_csv = df.copy()
+        
+        def format_list(val):
+            return str(val) if isinstance(val, list) and val else ""
+            
+        def format_dict(val):
+            return str(val) if isinstance(val, dict) and val else ""
+            
+        df_csv['emails'] = df_csv['emails'].apply(format_list)
+        df_csv['phones'] = df_csv['phones'].apply(format_list)
+        df_csv['socials'] = df_csv['socials'].apply(format_dict)
+        
+        import numpy as np
+        df_csv.replace("", np.nan, inplace=True)
+        
+        df_csv.to_csv(results_csv, index=False)
         with open(results_json, 'w', encoding='utf-8') as f:
-            json.dump(final_data, f, indent=4, default=str)
+            json.dump(filtered_data, f, indent=4, default=str)
 
     shopify_confirmed = counts['success'] + counts['borderline'] + counts['not_india']
     print("\n" + "="*45)

@@ -254,16 +254,10 @@ Records are treated as duplicates when they share a normalised domain or an iden
 | Column | Description |
 |---|---|
 | `domain_url` | `https://<domain>` |
-| `store_name` | Shop name from meta.json |
 | `emails`, `phones` | Lists |
 | `socials` | Dict `{platform: url}` |
 | `category`, `tagline`, `logo_url` | Strings |
-| `state`, `city` | Location (lower-case state) |
-| `*_found` | Booleans used to compute the miss rates |
-| `source` | Which source found the domain |
-| `india_signal` | Why the store was accepted, e.g. `meta.json country=IN (Haryana)` |
-| `india_confidence` | 100 for meta.json, otherwise the heuristic score |
-| `whois_shielded` | WHOIS privacy flag (heuristic path only) |
+| `state` | Location (lower-case state) |
 | `foreign_brand_india_storefront` | True for stores on `in.brand.com` (e.g., `in.loccitane.com`). Included but flagged as deciding if they count as "Indian" is an edge-case judgment call. |
 
 ---
